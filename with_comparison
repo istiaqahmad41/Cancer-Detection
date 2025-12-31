@@ -1,0 +1,186 @@
+# =====================================================
+# 1. INSTALL REQUIREMENTS
+# =====================================================
+!pip install pytorch-lightning==2.0 torchmetrics seaborn matplotlib
+
+# =====================================================
+# 2. IMPORTS
+# =====================================================
+import os, shutil, torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, random_split
+from torchvision import transforms
+from torchvision.datasets import ImageFolder
+from torchvision.models import (
+    efficientnet_b0, resnet50, vit_b_16, swin_t
+)
+
+import pytorch_lightning as pl
+from pytorch_lightning.callbacks import ModelCheckpoint
+import pandas as pd
+import matplotlib.pyplot as plt
+from sklearn.metrics import precision_score, recall_score, f1_score
+
+pl.seed_everything(42)
+
+# =====================================================
+# 3. DATASET
+# =====================================================
+data_dir = "/content/dataset"
+
+train_transform = transforms.Compose([
+    transforms.Resize((224,224)),
+    transforms.RandomHorizontalFlip(),
+    transforms.RandomRotation(10),
+    transforms.ToTensor(),
+])
+
+val_transform = transforms.Compose([
+    transforms.Resize((224,224)),
+    transforms.ToTensor(),
+])
+
+dataset = ImageFolder(data_dir, transform=train_transform)
+class_names = dataset.classes
+
+train_size = int(0.8 * len(dataset))
+val_size = len(dataset) - train_size
+train_ds, val_ds = random_split(dataset, [train_size, val_size])
+
+train_loader = DataLoader(train_ds, batch_size=16, shuffle=True)
+val_loader = DataLoader(val_ds, batch_size=16)
+
+# =====================================================
+# 4. LIQUID NEURAL NETWORK (PROPOSED)
+# =====================================================
+class LiquidCell(nn.Module):
+    def __init__(self, in_dim, hid_dim):
+        super().__init__()
+        self.W_in = nn.Linear(in_dim, hid_dim)
+        self.W_rec = nn.Linear(hid_dim, hid_dim, bias=False)
+        self.tau = nn.Linear(in_dim, hid_dim)
+
+    def forward(self, x, h):
+        tau = torch.sigmoid(self.tau(x)) + 1e-3
+        dh = (-h + torch.tanh(self.W_in(x) + self.W_rec(h))) / tau
+        return h + dh
+
+
+class CNN_LNN(nn.Module):
+    def __init__(self, num_classes):
+        super().__init__()
+        base = efficientnet_b0(weights="IMAGENET1K_V1")
+        self.cnn = nn.Sequential(*list(base.children())[:-1])
+        self.cell = LiquidCell(1280, 256)
+        self.fc = nn.Linear(256, num_classes)
+
+    def forward(self, x):
+        x = self.cnn(x).squeeze()
+        h = torch.zeros(x.size(0), 256, device=x.device)
+        for _ in range(6):
+            h = self.cell(x, h)
+        return self.fc(h)
+
+# =====================================================
+# 5. BASELINE MODELS
+# =====================================================
+def EfficientNetBaseline(n):
+    m = efficientnet_b0(weights="IMAGENET1K_V1")
+    m.classifier[1] = nn.Linear(1280, n)
+    return m
+
+def ResNetBaseline(n):
+    m = resnet50(weights="IMAGENET1K_V2")
+    m.fc = nn.Linear(2048, n)
+    return m
+
+def ViTBaseline(n):
+    m = vit_b_16(weights="IMAGENET1K_V1")
+    m.heads.head = nn.Linear(768, n)
+    return m
+
+def SwinBaseline(n):
+    m = swin_t(weights="IMAGENET1K_V1")
+    m.head = nn.Linear(768, n)
+    return m
+
+# =====================================================
+# 6. LIGHTNING TRAINER (COMMON)
+# =====================================================
+class LitModel(pl.LightningModule):
+    def __init__(self, model):
+        super().__init__()
+        self.model = model
+        self.loss = nn.CrossEntropyLoss()
+
+    def forward(self, x):
+        return self.model(x)
+
+    def training_step(self, batch, _):
+        x, y = batch
+        y_hat = self(x)
+        loss = self.loss(y_hat, y)
+        self.log("loss", loss)
+        return loss
+
+    def configure_optimizers(self):
+        return torch.optim.Adam(self.parameters(), lr=1e-4)
+
+# =====================================================
+# 7. TRAIN & EVALUATE FUNCTION
+# =====================================================
+def train_evaluate(model_name, model):
+    trainer = pl.Trainer(
+        max_epochs=5,
+        accelerator="gpu" if torch.cuda.is_available() else "cpu",
+        logger=False,
+        enable_checkpointing=False
+    )
+
+    lit_model = LitModel(model)
+    trainer.fit(lit_model, train_loader, val_loader)
+
+    preds, labels = [], []
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    lit_model.to(device)
+    lit_model.eval()
+
+    with torch.no_grad():
+        for x, y in val_loader:
+            x, y = x.to(device), y.to(device)
+            p = torch.argmax(lit_model(x), 1)
+            preds.extend(p.cpu())
+            labels.extend(y.cpu())
+
+    return {
+        "Model": model_name,
+        "Accuracy": (torch.tensor(preds) == torch.tensor(labels)).float().mean().item(),
+        "Precision": precision_score(labels, preds, average="macro"),
+        "Recall": recall_score(labels, preds, average="macro"),
+        "F1": f1_score(labels, preds, average="macro")
+    }
+
+# =====================================================
+# 8. RUN ALL MODELS
+# =====================================================
+results = []
+
+results.append(train_evaluate("ResNet-50", ResNetBaseline(len(class_names))))
+results.append(train_evaluate("EfficientNet-B0", EfficientNetBaseline(len(class_names))))
+results.append(train_evaluate("ViT-B/16", ViTBaseline(len(class_names))))
+results.append(train_evaluate("Swin-T", SwinBaseline(len(class_names))))
+results.append(train_evaluate("Proposed CNN–LNN", CNN_LNN(len(class_names))))
+
+df = pd.DataFrame(results)
+print(df)
+
+# =====================================================
+# 9. COMPARISON GRAPH (KEY FIGURE)
+# =====================================================
+plt.figure(figsize=(10,5))
+plt.bar(df["Model"], df["Accuracy"])
+plt.ylabel("Accuracy")
+plt.title("Model Comparison on Cancer Classification")
+plt.xticks(rotation=25)
+plt.grid(axis="y")
+plt.show()
